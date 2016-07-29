@@ -194,9 +194,12 @@ class DockerMonitor(object):
         rec = self._docker.inspect_container(cid)
 
         # ensure name is valid, and append our domain
-        name = get(rec, 'Name')
-        if not name:
-            return None
+        if 'Hostname' in rec['Config']:
+            name = rec['Config']['Hostname']
+        else:
+            name = get(rec, 'Name')
+            if not name:
+                return None
 
         id_ = get(rec, 'Id')
         labels = get(rec, 'Config', 'Labels')
