@@ -1,0 +1,9 @@
+{
+  "name": "dockerdns",
+  "version": "1.0.0",
+  "scripts": {
+    "docker-build": "node docker build",
+    "docker-push": "node docker push",
+    "docker-all": "node docker all"
+  }
+}

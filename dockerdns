@@ -1,70 +1,53 @@
 #!/usr/bin/env python
+# coding=utf-8
+"""
+simple, automatic, self-contained dns server for docker
+"""
+from __future__ import print_function, unicode_literals
 
-
-# dockerdns - simple, automatic, self-contained dns server for docker
-
-
-# python 3 compatibility
-from __future__ import print_function
-from future import standard_library
-from functools import reduce
-standard_library.install_aliases()
-from builtins import map
-from builtins import str
-from builtins import object
-
-# monkey patch everything
-from gevent import monkey
-monkey.patch_all()
-
-# core
 import argparse
-from collections import namedtuple
-from datetime import datetime
 import json
+import logging
 import os
 import re
 import signal
 import sys
-import time
-from urllib.parse import urlparse
+from _socket import gaierror
+from collections import namedtuple
+from functools import reduce
 
-# libs
-from dnslib import A, DNSHeader, DNSLabel, DNSRecord, QTYPE, RR
 import docker
 import gevent
-from gevent import socket, threading
-from gevent.server import DatagramServer
+import six
+from dnslib import A, DNSHeader, DNSLabel, DNSRecord, QTYPE, RR
+from future.moves.urllib import parse
+from gevent import threading, monkey
 from gevent.resolver_ares import Resolver
+from gevent.server import DatagramServer
 
+monkey.patch_all()
 
-PROCESS = 'dockerdns'
-DOCKER_SOCK = 'unix:///docker.sock'
-DNS_BINDADDR = '0.0.0.0:53'
-DNS_RESOLVER = ['8.8.8.8']
-DNS_RESOLVER_TIMEOUT = 3.0
-RE_VALIDNAME = re.compile('[^\w\d.-]')
-QUIET = 0
-EPILOG = '''
+PROCESS_NAME = 'dockerdns'
 
-'''
+logger = logging.getLogger(PROCESS_NAME)
+logger.setLevel(logging.DEBUG)
 
+ch = logging.StreamHandler(sys.stdout)
+ch.setLevel(logging.DEBUG)
+formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+ch.setFormatter(formatter)
+logger.addHandler(ch)
 
-Container = namedtuple('Container', 'id, name, running, addr')
+# noinspection SpellCheckingInspection
 
+RE_VALID_NAME = re.compile(r'[^\w\d.-]')
+RE_DNS_RECORD = re.compile(r'([a-zA-Z0-9_-]*):((?:[12]?[0-9]{1,2}\.){3}(?:[12]?[0-9]{1,2})$)')
 
-def log(msg, *args):
-    global QUIET
-    if not QUIET:
-        now = datetime.now().isoformat()
-        line = u'%s [%s] %s\n' % (now, PROCESS, msg % args)
-        sys.stderr.write(line)
-        sys.stderr.flush()
+Container = namedtuple('Container', 'id, name, running, address')
 
 
 def get(d, *keys):
-    empty = {}
-    return reduce(lambda d, k: d.get(k, empty), keys, d) or None
+    return reduce(lambda d, k: d.get(k, {}), keys, d) or None
 
 
 def contains(txt, *subs):
@@ -72,67 +55,79 @@ def contains(txt, *subs):
 
 
 class NameTable(object):
+    """
+    Table mapping names to addresses
+    """
 
-    'Table mapping names to addresses'
-
-    def __init__(self, records):
-        self._storage = {}
-        self._lock = threading.Lock()
-        for rec in records:
-            self.add(rec[0], rec[1])
-
-    def add(self, name, addr):
-        key = self._key(name)
-        if key:
-            with self._lock:
-                log('table.add %s -> %s', name, addr)
-                self._storage[key] = addr
-
-    def get(self, name):
-        key = self._key(name)
-        if key:
-            with self._lock:
-                res = self._storage.get(key)
-                log('table.get %s == %s', name, res)
-                return res
-
-    def rename(self, old_name, new_name):
-        if not old_name or not new_name:
-            return
-        old_name = old_name.lstrip('/')
-        old_key = self._key(old_name)
-        new_key = self._key(new_name)
-        with self._lock:
-            addr = self._storage.get(old_key)
-            if addr:
-                del self._storage[old_key]
-                new_key = self._key(new_name)
-                self._storage[new_key] = addr
-                log('table.rename (%s -> %s) == %s', old_name, new_name, addr)
-
-    def remove(self, name):
-        key = self._key(name)
-        if key:
-            with self._lock:
-                if key in self._storage:
-                    log('table.remove %s', name)
-                    del self._storage[key]
-
-    def _key(self, name):
+    @staticmethod
+    def _key(name):
+        # noinspection PyBroadException
         try:
             return DNSLabel(name.lower()).label
         except Exception:
             return None
 
+    def __init__(self, records):
+        self._storage = {}
+        self._lock = threading.Lock()
+        for record in records:
+            self.add(record[0], record[1])
+
+    def add(self, name, address):
+        with self._lock:
+            key = self._key(name)
+            if not key:
+                return
+            logger.info('table.add %s -> %s', name, address)
+            self._storage[key] = address
+
+    def get(self, name):
+        with self._lock:
+            key = self._key(name)
+            if not key:
+                return
+            result = self._storage.get(key)
+            logger.info('table.get %s == %s', name, result)
+            return result
+
+    def rename(self, old_name, new_name):
+        if not old_name or not new_name or old_name == new_name:
+            return
+
+        with self._lock:
+            address = self._storage.get(old_name)
+            if not address:
+                return
+
+            old_key = self._key(old_name)
+            del self._storage[old_key]
+
+            new_key = self._key(new_name)
+            self._storage[new_key] = address
+
+            logger.info('table.rename (%s -> %s) == %s', old_name, new_name, address)
+
+    def remove(self, name):
+        with self._lock:
+            key = self._key(name)
+            if not key:
+                return
+
+            if key in self._storage:
+                logger.info('table.remove %s', name)
+                del self._storage[key]
+
 
 class DockerMonitor(object):
+    """
+    Reads events from Docker and updates the name table
+    """
 
-    'Reads events from Docker and updates the name table'
-
-    def __init__(self, client, table, domain):
+    def __init__(self, client, table, domain, network_name=None):
         self._docker = client
         self._table = table
         self._domain = domain.lstrip('.')
+        self._network_name = network_name
 
     def run(self):
         # start the event poller, but don't read from the stream yet
@@ -140,182 +135,222 @@ class DockerMonitor(object):
 
         # bootstrap by inspecting all running containers
         for container in self._docker.containers():
-            for rec in self._inspect(container['Id']):
-                if rec.running:
-                    self._table.add(rec.name, rec.addr)
+            if not self._network_name or container['HostConfig']['NetworkMode'] == self._network_name:
+                for record in self._inspect(container['Id']):
+                    if record.running:
+                        self._table.add(record.name, record.address)
 
         # read the docker event stream and update the name table
-        for raw in events:
-            evt = json.loads(raw)
-            if evt.get('Type', 'container') == 'container':
-                cid = evt.get('id')
-                if cid is None:
-                    continue
-                status = evt.get('status')
-                if status in set(('start', 'die', 'rename')):
-                    try:
-                        for rec in self._inspect(cid):
-                            if status == 'start':
-                                self._table.add(rec.name, rec.addr)
+        for event_json in events:
+            event = json.loads(event_json)
+            if event.get('Type', 'container') == 'container':
+                container_id = event.get('id')
+                if container_id:
+                    status = event.get('status')
+                    if status in {'start', 'die', 'rename'}:
+                        # noinspection PyBroadException
+                        try:
+                            for record in self._inspect(container_id):
+                                if status == 'start':
+                                    self._table.add(record.name, record.address)
 
-                            elif status == 'rename':
-                                old_name = get(evt, 'Actor', 'Attributes', 'oldName')
-                                new_name = get(evt, 'Actor', 'Attributes', 'name')
-                                old_name = '.'.join((old_name, self._domain))
-                                new_name = '.'.join((new_name, self._domain))
-                                self._table.rename(old_name, new_name)
+                                elif status == 'rename':
+                                    old_name = get(event, 'Actor', 'Attributes', 'oldName')
+                                    new_name = get(event, 'Actor', 'Attributes', 'name')
+                                    old_name = '.'.join((old_name, self._domain))
+                                    new_name = '.'.join((new_name, self._domain))
+                                    self._table.rename(old_name, new_name)
 
-                            else:
-                                self._table.remove(rec.name)
+                                elif status == 'die':
+                                    self._table.remove(record.name)
 
-                    except Exception as e:
-                        log('Error: %s', e)
+                        except Exception:
+                            logger.exception('failed to process event')
 
-    def _get_names(self, name, labels):
-        names = [ RE_VALIDNAME.sub('', name).rstrip('.') ]
+    def _get_names(self, name):
+        names = [RE_VALID_NAME.sub('', name).rstrip('.')]
+        return tuple(['.'.join((name, self._domain)) for name in names])
 
-        labels = labels or {}
-        instance = int(labels.get('com.docker.compose.container-number', 1))
-        service = labels.get('com.docker.compose.service')
-        project = labels.get('com.docker.compose.project')
+    def _inspect(self, container_id):
+        """
+        get full details on this container from docker
+        :param container_id:
+        :return:
+        """
 
-        if all((instance, service, project)):
-            names.append('%d.%s.%s' % (instance, service, project))
-
-            # the first instance of a service is available without number
-            # prefix
-            if instance == 1:
-                names.append('%s.%s' % (service, project))
-
-        return [ '.'.join((name, self._domain)) for name in names ]
-
-    def _inspect(self, cid):
-        # get full details on this container from docker
-        rec = self._docker.inspect_container(cid)
+        record = self._docker.inspect_container(container_id)
 
         # ensure name is valid, and append our domain
-        if 'Hostname' in rec['Config']:
-            name = rec['Config']['Hostname']
+        if container_id.startswith(record['Config']['Hostname']):
+            name = get(record, 'Name').lstrip('/')
         else:
-            name = get(rec, 'Name')
-            if not name:
-                return None
+            name = record['Config']['Hostname']
 
-        id_ = get(rec, 'Id')
-        labels = get(rec, 'Config', 'Labels')
-        state = get(rec, 'State', 'Running')
-        ip_address = get(rec, 'NetworkSettings', 'IPAddress')
+        if not name:
+            return ()
 
-        return [ Container(id_, name, state, ip_address) for name in self._get_names(name, labels) ]
+        record_id = get(record, 'Id')
+        state = get(record, 'State', 'Running')
+
+        ip_address = None
+        if self._network_name:
+            ip_address = get(record, 'NetworkSettings', 'Networks', self._network_name, 'IPAddress')
+
+        if not ip_address:
+            ip_address = get(record, 'NetworkSettings', 'IPAddress')
+
+        return tuple([Container(record_id, name, state, ip_address) for name in self._get_names(name)])
 
 
 class DnsServer(DatagramServer):
-
-    '''
+    """
     Answers DNS queries against the name table, falling back to the recursive
     resolver (if present).
-    '''
+    """
 
-    def __init__(self, bindaddr, table, dns_servers=None):
-        DatagramServer.__init__(self, bindaddr)
+    def __init__(self, bind_address, table, dns_servers=None):
+        DatagramServer.__init__(self, bind_address)
         self._table = table
         self._resolver = None
         if dns_servers:
-            self._resolver = Resolver(servers=dns_servers,
-                timeout=DNS_RESOLVER_TIMEOUT, tries=1)
+            self._resolver = Resolver(
+                servers=dns_servers,
+                timeout=3.0,  # seconds
+                tries=1,
+            )
 
     def handle(self, data, peer):
-        rec = DNSRecord.parse(data)
-        addr = None
-        auth = False
-        if rec.q.qtype in (QTYPE.A, QTYPE.AAAA, QTYPE.ANY):
-            addr = self._table.get(rec.q.qname.idna())
-            if addr:
-                auth = True
-                if rec.q.qtype == QTYPE.AAAA:
-                    addr=None
+        record = DNSRecord.parse(data)
+        address = None
+        authoritative = False
+        if record.q.qtype in (QTYPE.A, QTYPE.AAAA, QTYPE.ANY):
+            address = self._table.get(record.q.qname.idna())
+            if address:
+                authoritative = True
+                if record.q.qtype == QTYPE.AAAA:
+                    address = None
             else:
-                addr = self._resolve('.'.join(rec.q.qname.label))
-        self.socket.sendto(self._reply(rec, auth, addr), peer)
+                address = self._resolve('.'.join(record.q.qname.label))
 
-    def _reply(self, rec, auth, addr=None):
-        reply = DNSRecord(DNSHeader(id=rec.header.id, qr=1, aa=auth, ra=bool(self._resolver)), q=rec.q)
-        if addr:
-            reply.add_answer(RR(rec.q.qname, QTYPE.A, rdata=A(addr)))
+        self.socket.sendto(self._reply(record, authoritative, address), peer)
+
+    def _reply(self, record, authoritative, address=None):
+        reply = DNSRecord(
+            DNSHeader(
+                id=record.header.id,
+                qr=1,
+                aa=authoritative,
+                ra=bool(self._resolver),
+            ),
+            q=record.q,
+        )
+        if address:
+            reply.add_answer(RR(record.q.qname, QTYPE.A, rdata=A(address)))
+
         return reply.pack()
 
     def _resolve(self, name):
         if not self._resolver:
             return None
+
         try:
             return self._resolver.gethostbyname(name)
-        except socket.gaierror as e:
-            msg = str(e)
-            if not contains(msg, 'ETIMEOUT', 'ENOTFOUND'):
-                print(msg)
+        except gaierror as e:
+            if not contains(str(e), 'ETIMEOUT', 'ENOTFOUND'):
+                logger.exception('failed to resolve entry: %s', name)
 
 
 def stop(*servers):
-    for svr in servers:
-        if svr.started:
-            svr.stop()
+    for server in servers:
+        if server.started:
+            server.stop()
+
     sys.exit(signal.SIGINT)
 
-def splitrecord(rec):
-    m = re.match('([a-zA-Z0-9_-]*):((?:[12]?[0-9]{1,2}\.){3}(?:[12]?[0-9]{1,2}){1}$)', rec)
-    if not m:
-        log('--record has invalid format, expects: `--record <host>:<ip>`')
-        sys.exit(1)
-    else:
-        return (m.group(1), m.group(2))
 
-def check(args):
-    url = urlparse(args.docker)
-    if url.scheme in ('unix','unix+http'):
-        # check if the socket file exists
-        if not os.path.exists(url.path):
-            log('unix socket %r does not exist', url.path)
-            sys.exit(1)
+def split_record(record):
+    match = RE_DNS_RECORD.match(record)
+    if not match:
+        logger.error('--record has invalid format, expects: `--record <host>:<ip>`')
+        sys.exit(1)
+
+    return match.group(1), match.group(2)
+
 
 def parse_args():
-    docker_url = os.environ.get('DOCKER_HOST')
-    if not docker_url:
-        docker_url = DOCKER_SOCK
-    parser = argparse.ArgumentParser(PROCESS, epilog=EPILOG,
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument('--docker', default=docker_url,
-        help='Url to docker TCP/UNIX socket')
-    parser.add_argument('--dns-bind', default=DNS_BINDADDR,
-        help='Bind address for DNS server')
-    parser.add_argument('--domain', default='docker',
-        help='Base domain name for registered services')
-    parser.add_argument('--resolver', default=DNS_RESOLVER, nargs='*',
-        help='Servers for recursive DNS resolution')
-    parser.add_argument('--no-recursion', action='store_const', const=1,
-        help='Disables recursive DNS queries')
-    parser.add_argument('-q', '--quiet', action='store_const', const=1,
-        help='Quiet mode')
-    parser.add_argument('-r', '--record', nargs="*", default=[],
-        help="Add a static record `name:host`")
+    docker_url = os.environ.get('DOCKER_HOST') or 'unix:///docker.sock'
+
+    parser = argparse.ArgumentParser(
+        PROCESS_NAME,
+        epilog='\n',
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+
+    parser.add_argument(
+        '--docker',
+        default=docker_url,
+        help='Url to docker TCP/UNIX socket',
+    )
+
+    parser.add_argument(
+        '--dns-bind',
+        default='0.0.0.0:53',
+        help='Bind address for DNS server',
+    )
+
+    parser.add_argument(
+        '--domain',
+        default='docker',
+        help='Base domain name for registered services',
+    )
+
+    parser.add_argument(
+        '--network',
+        default='',
+        help='Name of the docker network',
+    )
+
+    parser.add_argument(
+        '--resolver',
+        default=['8.8.8.8', '8.8.4.4'],
+        nargs='*',
+        help='Servers for recursive DNS resolution',
+    )
+
+    parser.add_argument(
+        '--no-recursion',
+        action='store_const',
+        const=1,
+        help='Disables recursive DNS queries',
+    )
+
+    parser.add_argument(
+        '-r',
+        '--record',
+        nargs='*',
+        default=[],
+        help='Add a static record "name:host"',
+    )
+
     return parser.parse_args()
 
 
-def main():
-    global QUIET
+if __name__ == '__main__':
     args = parse_args()
-    check(args)
-    if args.record:
-        args.record = map(splitrecord, args.record)
+    url = parse.urlparse(args.docker)
+    if url.scheme in ('unix', 'unix+http'):
+        # check if the socket file exists
+        if not os.path.exists(url.path):
+            logger.error('unix socket %s does not exist', url.path)
+            sys.exit(1)
 
-    QUIET = args.quiet
+    if args.record:
+        args.record = six.moves.map(split_record, args.record)
+
     resolver = () if args.no_recursion else args.resolver
-    table = NameTable([(k + "." + args.domain, v) for (k, v) in args.record])
-    monitor = DockerMonitor(docker.Client(args.docker, version='auto'), table, args.domain)
+    table = NameTable([(k + '.' + args.domain, v) for (k, v) in args.record])
+    monitor = DockerMonitor(docker.Client(args.docker, version='auto'), table, args.domain, args.network)
     dns = DnsServer(args.dns_bind, table, resolver)
     gevent.signal(signal.SIGINT, stop, dns)
     dns.start()
     gevent.wait([gevent.spawn(monitor.run)])
-
-
-if __name__ == '__main__':
-    main()
